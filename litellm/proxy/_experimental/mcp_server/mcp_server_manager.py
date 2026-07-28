@@ -280,6 +280,47 @@ def _issuer_matches(claimed_issuer: object, configured_issuer: str) -> bool:
     return _normalized_authorize_endpoint(claimed_issuer) == _normalized_authorize_endpoint(configured_issuer)
 
 
+def _admin_pinned_issuer(row_issuer: str | None, recorded_discovered_issuer: str | None) -> str | None:
+    """The issuer an admin actually pinned, out of the single ``issuer`` column that holds both
+    admin-pinned and trust-on-first-use discovered values.
+
+    ``_persist_discovered_oauth_endpoints`` backfills a discovered issuer onto the row so the value is
+    stable for the token identity and visible in the UI. Anchoring (endpoints come solely from the
+    §3.3-validated issuer document, fail-closed when its fetch fails) is admin intent, so the row alone
+    cannot decide it: without provenance a backfilled issuer is indistinguishable from a pinned one and
+    every discovering server silently turns fail-closed, so one transient metadata fetch failure drops
+    the admin's stored endpoints and breaks /authorize until an unrelated config write. The discovery
+    write records the value it backfilled under ``credentials.discovered_issuer``, and a row issuer
+    equal to that witness is discovered, not pinned. An admin who later types a different issuer no
+    longer matches the witness, so their value pins and anchors as before.
+    """
+    issuer = _blank_to_none(row_issuer)
+    if issuer is None:
+        return None
+    witness = _blank_to_none(recorded_discovered_issuer)
+    if witness is not None and _issuer_matches(witness, issuer):
+        return None
+    return issuer
+
+
+def _oauth_endpoints_unresolved(server: MCPServer) -> bool:
+    """Whether an OAuth server in the registry is missing an endpoint its flow needs, so the next DB
+    reload must rebuild it instead of taking the ``updated_at`` fast path.
+
+    Discovery runs at build time only, and the reload fast-path reuses an unchanged row's registry
+    entry verbatim, so a server whose discovery came back empty (transient upstream failure, rate
+    limiting) stays broken until some unrelated config write bumps ``updated_at``; /authorize keeps
+    serving its 400 in the meantime. Rebuilding just these entries retries discovery on the normal
+    reload cadence. It costs no extra fetch for servers that resolved, and none for those with no
+    discovery source, since the build skips discovery for both.
+    """
+    if server.auth_type not in _UPSTREAM_OAUTH_DISCOVERY_AUTH_TYPES:
+        return False
+    if server.oauth2_flow == "client_credentials":
+        return server.token_url is None
+    return server.authorization_url is None or server.token_url is None
+
+
 def _endpoints_corroborate_authorization_url(
     source_authorization_url: str | None,
     trusted_authorization_url: str | None,
@@ -1911,7 +1952,10 @@ class MCPServerManager:
 
         auth_type = cast(MCPAuthType, mcp_server.auth_type)
         server_url = mcp_server.url
-        manual_issuer = _blank_to_none(mcp_server.issuer)
+        row_issuer = _blank_to_none(mcp_server.issuer)
+        manual_issuer = _admin_pinned_issuer(
+            row_issuer, credentials_dict.get("discovered_issuer") if credentials_dict else None
+        )
         manual_authorization_url = _blank_to_none(mcp_server.authorization_url)
         manual_token_url = _blank_to_none(mcp_server.token_url)
         manual_registration_url = _blank_to_none(mcp_server.registration_url)
@@ -1946,7 +1990,7 @@ class MCPServerManager:
             if gated_oauth_metadata and not gated_oauth_metadata.from_origin_fallback
             else None
         )
-        effective_issuer = manual_issuer or discovered_issuer
+        effective_issuer = row_issuer or discovered_issuer
 
         new_server = MCPServer(
             server_id=mcp_server.server_id,
@@ -2043,7 +2087,7 @@ class MCPServerManager:
             await self._persist_discovered_oauth_endpoints(
                 server_id=mcp_server.server_id,
                 auth_type=auth_type,
-                existing_issuer=manual_issuer,
+                existing_issuer=row_issuer,
                 existing_authorization_url=manual_authorization_url,
                 existing_token_url=manual_token_url,
                 existing_scopes=scopes,
@@ -2112,6 +2156,11 @@ class MCPServerManager:
         failed write re-discovers on the next build. Scopes go through ``update_mcp_server`` so
         they merge into the credentials blob without touching the stored client credentials.
 
+        A backfilled ``issuer`` is also recorded under ``credentials.discovered_issuer``. The column
+        alone cannot say whether the value was pinned by an admin, which anchors the server (endpoints
+        come solely from the issuer document, fail-closed), or backfilled here, which must not; that
+        witness is what ``_admin_pinned_issuer`` reads to tell the two apart.
+
         For an issuer-anchored server (``is_issuer_anchored``) the endpoints are re-derived from the
         §3.3-validated issuer document on every build, so they are NOT persisted into the endpoint
         columns: persisting them would make the next build see populated endpoints and treat them as
@@ -2122,9 +2171,8 @@ class MCPServerManager:
             return
         if metadata is None or metadata.from_origin_fallback:
             return
-        issuer_update = (
-            {"issuer": metadata.discovered_issuer} if metadata.discovered_issuer and not existing_issuer else {}
-        )
+        writes_discovered_issuer = bool(metadata.discovered_issuer) and not existing_issuer
+        issuer_update = {"issuer": metadata.discovered_issuer} if writes_discovered_issuer else {}
         authorization_url_update = (
             {"authorization_url": metadata.authorization_url}
             if metadata.authorization_url and not existing_authorization_url and not is_issuer_anchored
@@ -2135,12 +2183,15 @@ class MCPServerManager:
             if metadata.token_url and not existing_token_url and not is_issuer_anchored
             else {}
         )
-        scopes_update = {"credentials": {"scopes": metadata.scopes}} if metadata.scopes and not existing_scopes else {}
+        credentials_update = {
+            **({"discovered_issuer": metadata.discovered_issuer} if writes_discovered_issuer else {}),
+            **({"scopes": metadata.scopes} if metadata.scopes and not existing_scopes else {}),
+        }
         updates: dict[str, object] = {
             **issuer_update,
             **authorization_url_update,
             **token_url_update,
-            **scopes_update,
+            **({"credentials": credentials_update} if credentials_update else {}),
         }
         if not updates:
             return
@@ -5347,6 +5398,7 @@ class MCPServerManager:
                     and existing_server.updated_at is not None
                     and server.updated_at is not None
                     and existing_server.updated_at == server.updated_at
+                    and not _oauth_endpoints_unresolved(existing_server)
                 ):
                     # Re-use existing server instance to avoid re-running build_mcp_server_from_table()
                     # which can perform network discovery for OAuth2 servers.

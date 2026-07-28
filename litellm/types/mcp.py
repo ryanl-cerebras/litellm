@@ -110,6 +110,16 @@ class MCPCredentials(TypedDict, total=False):
     OAuth 2.0 scopes to request when exchanging the client credentials
     """
 
+    discovered_issuer: Optional[str]
+    """
+    The issuer value OAuth discovery backfilled onto the ``issuer`` column, trust-on-first-use.
+
+    Provenance witness, not a setting: the column holds both admin-pinned and discovered issuers, and
+    only a pinned one anchors the server's endpoints to the RFC 8414 issuer document (fail-closed when
+    its metadata fetch fails). Written by the discovery write-back only; an admin-typed issuer that
+    differs from this value pins. Not a secret, so stored unencrypted.
+    """
+
     # AWS SigV4 fields
     aws_access_key_id: Optional[str]
     """AWS access key ID for SigV4 signing. Optional — falls back to boto3 credential chain."""

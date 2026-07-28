@@ -1500,6 +1500,108 @@ class TestMCPServerManager:
         assert built.scopes == ["read", "write"]
 
     @pytest.mark.asyncio
+    async def test_build_from_table_discovered_issuer_does_not_anchor_or_drop_stored_endpoints(self):
+        """A trust-on-first-use issuer must not turn the server fail-closed.
+
+        A server configured with explicit endpoints and no issuer has the discovered issuer backfilled
+        onto its row; the write records the value under credentials.discovered_issuer so the next build
+        can tell it apart from an admin-pinned one. Without that provenance the rebuild treated the
+        backfilled value as pinned, discarded the stored endpoint columns, and one failed metadata
+        fetch left authorization_url None, so /authorize served its 400 until an unrelated config write.
+        """
+        manager = MCPServerManager()
+
+        def row(issuer=None, credentials=None):
+            return LiteLLM_MCPServerTable(
+                server_id="tofu-issuer-1",
+                alias="tofu_issuer",
+                description="explicit endpoints, issuer left empty",
+                url="https://up.example.com/mcp",
+                transport=MCPTransport.http,
+                auth_type=MCPAuth.oauth2,
+                oauth2_flow="authorization_code",
+                issuer=issuer,
+                credentials=credentials,
+                authorization_url="https://idp.example.com/authorize",
+                token_url="https://idp.example.com/token",
+                registration_url="https://idp.example.com/register",
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+
+        discovered = MCPOAuthMetadata(
+            authorization_url="https://idp.example.com/authorize",
+            token_url="https://idp.example.com/token",
+            discovered_issuer="https://idp.example.com",
+        )
+        update_mcp_server_mock = AsyncMock()
+        with (
+            patch.object(manager, "_descovery_metadata", new=AsyncMock(return_value=discovered)),
+            patch("litellm.proxy._experimental.mcp_server.db.update_mcp_server", new=update_mcp_server_mock),
+            patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        ):
+            first = await manager.build_mcp_server_from_table(row(), credentials_are_encrypted=False)
+
+        assert first.issuer == "https://idp.example.com"
+        assert first.issuer_is_anchored is False
+        persisted = update_mcp_server_mock.call_args.kwargs["data"]
+        assert persisted.issuer == "https://idp.example.com"
+        assert persisted.credentials == {"discovered_issuer": "https://idp.example.com"}
+
+        with (
+            patch.object(manager, "_fetch_issuer_anchored_oauth_metadata", new=AsyncMock(return_value=None)) as anchored,
+            patch.object(manager, "_descovery_metadata", new=AsyncMock(return_value=None)),
+        ):
+            second = await manager.build_mcp_server_from_table(
+                row(issuer="https://idp.example.com", credentials={"discovered_issuer": "https://idp.example.com/"}),
+                credentials_are_encrypted=False,
+                persist_discovered_endpoints=False,
+            )
+
+        anchored.assert_not_awaited()
+        assert second.issuer_is_anchored is False
+        assert second.issuer == "https://idp.example.com"
+        assert second.authorization_url == "https://idp.example.com/authorize"
+        assert second.token_url == "https://idp.example.com/token"
+        assert second.registration_url == "https://idp.example.com/register"
+
+    @pytest.mark.asyncio
+    async def test_build_from_table_admin_issuer_still_anchors_when_it_differs_from_discovered_witness(self):
+        """The provenance witness only exempts the value discovery itself wrote. An admin who pins a
+        different issuer on a server that had already discovered one gets the strict RFC 8414 §3.3
+        behavior: the issuer document is the only endpoint source and the stored columns do not apply."""
+        manager = MCPServerManager()
+        row = LiteLLM_MCPServerTable(
+            server_id="repinned-issuer-1",
+            alias="repinned_issuer",
+            description="admin-pinned issuer over a previously discovered one",
+            url="https://up.example.com/mcp",
+            transport=MCPTransport.http,
+            auth_type=MCPAuth.oauth2,
+            oauth2_flow="authorization_code",
+            issuer="https://admin-pinned.example.com",
+            credentials={"discovered_issuer": "https://idp.example.com"},
+            authorization_url="https://idp.example.com/authorize",
+            token_url="https://idp.example.com/token",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+        )
+
+        with (
+            patch.object(manager, "_fetch_issuer_anchored_oauth_metadata", new=AsyncMock(return_value=None)) as anchored,
+            patch.object(manager, "_descovery_metadata", new=AsyncMock(return_value=None)) as resource_rooted,
+        ):
+            built = await manager.build_mcp_server_from_table(
+                row, credentials_are_encrypted=False, persist_discovered_endpoints=False
+            )
+
+        anchored.assert_awaited_once_with("https://admin-pinned.example.com", "https://up.example.com/mcp")
+        resource_rooted.assert_not_awaited()
+        assert built.issuer_is_anchored is True
+        assert built.authorization_url is None
+        assert built.token_url is None
+
+    @pytest.mark.asyncio
     async def test_fetch_issuer_anchored_metadata_takes_endpoints_from_issuer_scopes_from_resource(self):
         """The issuer-anchored helper adopts token_endpoint/registration_endpoint from the pinned
         issuer's own §3.3-validated document, but the scopes are resource-driven: it fetches the
@@ -5839,8 +5941,10 @@ class TestMCPServerTimestamps:
     @pytest.mark.asyncio
     async def test_persist_discovered_oauth_endpoints_writes_discovered_issuer_trust_on_first_use(self):
         """A server with no configured issuer records the discovered issuer trust-on-first-use, so the
-        next rebuild anchors discovery on it (RFC 8414 §3.3) instead of re-trusting the resource. When
-        an issuer is already set (admin-typed or a prior discovery), it is never overwritten."""
+        value is stable for the token identity and visible in the UI. It is recorded under
+        credentials.discovered_issuer too: that witness is what keeps the next build from mistaking the
+        backfill for an admin pin and turning the server fail-closed. When an issuer is already set
+        (admin-typed or a prior discovery), it is never overwritten."""
         manager = MCPServerManager()
         metadata = MCPOAuthMetadata(
             authorization_url="https://idp.example.com/authorize",
@@ -5875,6 +5979,7 @@ class TestMCPServerTimestamps:
         assert update_mcp_server_mock.await_count == 1
         persisted = update_mcp_server_mock.call_args.kwargs["data"]
         assert persisted.issuer == "https://idp.example.com"
+        assert persisted.credentials == {"discovered_issuer": "https://idp.example.com"}
 
     @pytest.mark.asyncio
     async def test_persist_discovered_oauth_endpoints_does_not_persist_endpoints_for_issuer_anchored(self):
