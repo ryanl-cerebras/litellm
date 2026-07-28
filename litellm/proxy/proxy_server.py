@@ -6158,11 +6158,16 @@ class ProxyConfig:
         self,
         prisma_client: PrismaClient,
         proxy_logging_obj: ProxyLogging,
-    ):
+    ) -> bool:
         """
         - Check db for new models
         - Check if model id's in router already
         - If not, add to router
+
+        Returns whether the reload pass completed without raising. Callers that just
+        triggered a write use this to tell the caller the pod failed to reload at all;
+        a True return still says nothing about any single deployment, which
+        `ignore_invalid_deployments` can have dropped individually.
         """
         global llm_router, llm_model_list, master_key, general_settings
 
@@ -6197,11 +6202,13 @@ class ProxyConfig:
 
             # initialize vector stores, guardrails, etc. table in db
             await self._init_non_llm_objects_in_db(prisma_client=prisma_client)
+            return True
 
         except Exception as e:
             verbose_proxy_logger.exception(
                 "litellm.proxy.proxy_server.py::ProxyConfig:add_deployment - {}".format(str(e))
             )
+            return False
 
     async def _init_non_llm_objects_in_db(self, prisma_client: PrismaClient):
         """

@@ -13,6 +13,7 @@ model/{model_id}/update - PATCH endpoint for model update.
 import asyncio
 import datetime
 import json
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
@@ -272,7 +273,7 @@ async def patch_model(
         )
 
         # Clear cache and reload models (uses config setting or defaults to preserving config models for DB updates)
-        await clear_cache()
+        reload_succeeded = await clear_cache()
 
         ## CREATE AUDIT LOG ##
         asyncio.create_task(
@@ -286,6 +287,12 @@ async def patch_model(
                 litellm_changed_by=user_api_key_dict.user_id,
                 litellm_proxy_admin_name=LITELLM_PROXY_ADMIN_NAME,
             )
+        )
+
+        raise_if_write_dropped_on_reload(
+            reload_succeeded=reload_succeeded,
+            written_models=[(model_id, getattr(updated_model, "model_info", None))],
+            action="update",
         )
 
         return updated_model
@@ -370,7 +377,7 @@ async def _set_model_blocked_status(
             },
         )
 
-        await clear_cache()
+        reload_succeeded = await clear_cache()
 
         asyncio.create_task(
             create_object_audit_log(
@@ -385,6 +392,12 @@ async def _set_model_blocked_status(
                 litellm_changed_by=litellm_changed_by,
                 litellm_proxy_admin_name=litellm_proxy_admin_name,
             )
+        )
+
+        raise_if_write_dropped_on_reload(
+            reload_succeeded=reload_succeeded,
+            written_models=[(data.model_id, getattr(updated_model, "model_info", None))],
+            action=action,
         )
 
         return updated_model
@@ -713,13 +726,8 @@ async def _get_team_deployments(
     # Confirm team_id in model_info (defensive check)
     result = []
     for row in response:
-        model_info = row.model_info
-        if isinstance(model_info, str):
-            try:
-                model_info = json.loads(model_info)
-            except (TypeError, ValueError):
-                continue
-        if isinstance(model_info, dict) and model_info.get("team_id") == team_id:
+        model_info = model_info_as_mapping(row.model_info)
+        if model_info is not None and model_info.get("team_id") == team_id:
             result.append(row)
     return result
 
@@ -770,13 +778,8 @@ async def _get_team_public_model_names(
     deployments = await _get_team_deployments(team_id, prisma_client)
     public_names: Set[str] = set()
     for row in deployments:
-        model_info = row.model_info
-        if isinstance(model_info, str):
-            try:
-                model_info = json.loads(model_info)
-            except (TypeError, ValueError):
-                continue
-        if isinstance(model_info, dict):
+        model_info = model_info_as_mapping(row.model_info)
+        if model_info is not None:
             public_name = model_info.get("team_public_model_name")
             if public_name:
                 public_names.add(public_name)
@@ -853,18 +856,11 @@ async def _update_existing_team_model_assignment(
     def _get_team_public_model_name(
         model_info: Optional[Union[dict, str]],
     ) -> Optional[str]:
-        if isinstance(model_info, dict):
-            value = model_info.get("team_public_model_name")
-            return value if isinstance(value, str) else None
-        if isinstance(model_info, str):
-            try:
-                parsed = json.loads(model_info)
-            except (TypeError, ValueError):
-                return None
-            if isinstance(parsed, dict):
-                value = parsed.get("team_public_model_name")
-                return value if isinstance(value, str) else None
-        return None
+        parsed = model_info_as_mapping(model_info)
+        if parsed is None:
+            return None
+        value = parsed.get("team_public_model_name")
+        return value if isinstance(value, str) else None
 
     old_public_name = db_model.model_info.team_public_model_name if db_model.model_info else None
 
@@ -1275,6 +1271,7 @@ async def add_new_model(
             - store keys separately
             """
 
+            reload_succeeded = False
             try:
                 _original_litellm_model_name = model_params.model_name
                 if model_params.model_info.team_id is None:
@@ -1289,7 +1286,9 @@ async def add_new_model(
                         user_api_key_dict=user_api_key_dict,
                         prisma_client=prisma_client,
                     )
-                await proxy_config.add_deployment(prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj)
+                reload_succeeded = await proxy_config.add_deployment(
+                    prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj
+                )
                 # don't let failed slack alert block the /model/new response
                 _alerting = general_settings.get("alerting", []) or []
                 if "slack" in _alerting:
@@ -1328,6 +1327,12 @@ async def add_new_model(
                 litellm_changed_by=user_api_key_dict.user_id,
                 litellm_proxy_admin_name=LITELLM_PROXY_ADMIN_NAME,
             )
+        )
+
+        raise_if_write_dropped_on_reload(
+            reload_succeeded=reload_succeeded,
+            written_models=[(model_response.model_id, getattr(model_response, "model_info", None))],
+            action="create",
         )
 
         return model_response
@@ -1450,8 +1455,7 @@ async def update_model(
             )
 
             # Clear cache and reload models (uses config setting or defaults to preserving config models for DB updates)
-            await clear_cache()
-
+            reload_succeeded = await clear_cache()
             ## CREATE AUDIT LOG ##
             asyncio.create_task(
                 create_object_audit_log(
@@ -1472,6 +1476,12 @@ async def update_model(
                     litellm_changed_by=user_api_key_dict.user_id,
                     litellm_proxy_admin_name=LITELLM_PROXY_ADMIN_NAME,
                 )
+            )
+
+            raise_if_write_dropped_on_reload(
+                reload_succeeded=reload_succeeded,
+                written_models=[(_model_id, getattr(model_response, "model_info", None))],
+                action="update",
             )
 
             return model_response
@@ -1677,9 +1687,88 @@ def _deduplicate_litellm_router_models(models: List[Dict]) -> List[Dict]:
     return unique_models
 
 
-async def clear_cache():
+def model_info_as_mapping(model_info: object) -> Mapping[str, object] | None:
+    """A DB row's model_info column arrives as a dict or as its JSON string depending on
+    the query path, and every consumer needs the mapping. Single owner of that parse:
+    returns None when no usable mapping exists (None, an unparseable string, or JSON
+    that is not an object), and callers choose what None means for them."""
+    if isinstance(model_info, Mapping):
+        return model_info
+    if not isinstance(model_info, str):
+        return None
+    try:
+        parsed = json.loads(model_info)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def written_model_ids_not_live(written_models: Sequence[tuple[str, object]]) -> tuple[str, ...]:
+    """Return the ids from `written_models` (pairs of model_id and the row's model_info)
+    that a caller-triggered reload should have loaded into this pod's router but did not.
+    A model whose model_info scopes it to another LITELLM_ENVIRONMENT is expected to be
+    absent, so it is never reported; a misconfigured environment gate raises during load
+    too, so ValueError from the shared predicate counts as expecting liveness.
+    Re-imports `llm_router` because the reload can rebind the module global, making any
+    reference the endpoint captured before the reload stale."""
+    from litellm.proxy.proxy_server import llm_router
+    from litellm.router import model_info_is_active_for_environment
+
+    def _expects_liveness(model_info: object) -> bool:
+        try:
+            return model_info_is_active_for_environment(model_info=model_info_as_mapping(model_info))
+        except ValueError:
+            return True
+
+    return tuple(
+        model_id
+        for model_id, model_info in written_models
+        if _expects_liveness(model_info)
+        and (llm_router is None or llm_router.get_deployment(model_id=model_id) is None)
+    )
+
+
+def raise_if_write_dropped_on_reload(
+    reload_succeeded: bool,
+    written_models: Sequence[tuple[str, object]],
+    action: str,
+) -> None:
+    """Turn a silent post-write reload failure into the caller-visible error this pod's
+    write endpoints owe their caller. The DB write is durable either way and every other
+    pod reloads on its own interval; this speaks only for the handling pod."""
+    if not reload_succeeded:
+        raise ProxyException(
+            message=(
+                f"Model {action} was saved to the database, but this pod failed to reload models afterwards, "
+                "so the change is not being served by this pod yet. Other pods reload on their own interval. "
+                "Check server logs for 'ProxyConfig:add_deployment' or 'Failed to clear cache' for the cause."
+            ),
+            type=ProxyErrorTypes.internal_server_error,
+            code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            param=None,
+        )
+    dropped = written_model_ids_not_live(written_models)
+    if not dropped:
+        return
+    raise ProxyException(
+        message=(
+            f"Model {action} was saved to the database, but the model id(s) {list(dropped)} failed to load "
+            "into this pod's live router after the reload and are not being served by this pod. Other pods "
+            "reload on their own interval. Check server logs for 'Error upserting deployment' or "
+            "'Error creating deployment' for the cause."
+        ),
+        type=ProxyErrorTypes.internal_server_error,
+        code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        param=None,
+    )
+
+
+async def clear_cache() -> bool:
     """
-    Clear router caches and reload models.
+    Clear router caches and reload models. Returns whether the reload pass completed
+    without raising, so write endpoints can tell their caller when this pod failed to
+    reload at all; True still says nothing about any single deployment, which
+    `ignore_invalid_deployments` can have dropped individually.
     """
     from litellm.proxy.proxy_server import (
         llm_router,
@@ -1691,7 +1780,7 @@ async def clear_cache():
 
     if llm_router is None or prisma_client is None:
         verbose_proxy_logger.debug("llm_router or prisma_client is None, skipping cache clear")
-        return
+        return False
 
     try:
         # Only clear DB models, preserve config models
@@ -1738,10 +1827,14 @@ async def clear_cache():
             llm_router.quality_routers.pop(model_name, None)
 
         # Reload only DB models
-        await proxy_config.add_deployment(prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj)
+        reload_succeeded = await proxy_config.add_deployment(
+            prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj
+        )
 
         verbose_proxy_logger.debug(
             f"Cleared {len(db_model_ids)} DB models, preserved {len(config_models)} config models"
         )
+        return reload_succeeded
     except Exception as e:
         verbose_proxy_logger.exception(f"Failed to clear cache and reload models. Due to error - {str(e)}")
+        return False

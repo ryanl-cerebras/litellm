@@ -160,7 +160,9 @@ async def test_create_access_group_with_model_names_tags_all_deployments():
             {
                 "model_name": "gpt-4o",
                 "litellm_params": {"model": "gpt-4o", "api_key": "fake-key"},
+                "model_info": {"id": deployment_id, "db_model": True},
             }
+            for deployment_id in ("deploy-A", "deploy-B", "deploy-C")
         ]
     )
 
@@ -318,3 +320,74 @@ async def test_create_access_group_invalid_model_id_returns_400():
             await create_model_group(data=request_data, user_api_key_dict=mock_user)
         assert exc_info.value.status_code == 400
         assert "non-existent-id" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_create_access_group_surfaces_dropped_models():
+    """An access-group write whose reload does not leave the tagged models live on this
+    pod must report the drop through this file's HTTPException contract, not a 200."""
+    from fastapi import HTTPException
+
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.model_access_group_management_endpoints import (
+        create_model_group,
+    )
+    from litellm.types.proxy.management_endpoints.model_management_endpoints import (
+        NewModelGroupRequest,
+    )
+
+    deploy_a = MagicMock(model_id="deploy-A", model_name="gpt-4o", model_info={})
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_proxymodeltable.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_proxymodeltable.find_unique = AsyncMock(return_value=deploy_a)
+    mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
+
+    mock_user = UserAPIKeyAuth(user_id="test_admin", user_role=LitellmUserRoles.PROXY_ADMIN)
+
+    with (
+        patch("litellm.proxy.proxy_server.llm_router", None),
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma),
+        patch(
+            "litellm.proxy.management_endpoints.model_access_group_management_endpoints.clear_cache",
+            new=AsyncMock(return_value=True),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await create_model_group(
+                data=NewModelGroupRequest(access_group="production-models", model_ids=["deploy-A"]),
+                user_api_key_dict=mock_user,
+            )
+
+    assert exc_info.value.status_code == 500
+    assert "deploy-A" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_tag_deployment_parses_string_model_info_and_refuses_corrupt():
+    """The model_info column can arrive as its JSON string; tagging must parse it rather
+    than crash, and must refuse to rewrite a present-but-unreadable value."""
+    from litellm.proxy.management_endpoints.model_access_group_management_endpoints import (
+        _tag_deployment_with_access_group,
+    )
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_proxymodeltable.update = AsyncMock()
+
+    pair = await _tag_deployment_with_access_group(
+        model_id="deploy-str",
+        model_info='{"access_groups": ["existing"]}',
+        access_group="new-group",
+        prisma_client=mock_prisma,
+    )
+    assert pair is not None
+    assert pair[0] == "deploy-str"
+    assert pair[1]["access_groups"] == ["existing", "new-group"]
+
+    with pytest.raises(ValueError, match="deploy-corrupt"):
+        await _tag_deployment_with_access_group(
+            model_id="deploy-corrupt",
+            model_info="{not json",
+            access_group="new-group",
+            prisma_client=mock_prisma,
+        )
